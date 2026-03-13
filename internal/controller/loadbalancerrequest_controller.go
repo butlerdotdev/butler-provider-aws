@@ -18,8 +18,8 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -27,6 +27,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	elbv2 "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	elbv2types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
+	smithy "github.com/aws/smithy-go"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -48,6 +49,13 @@ const (
 	lbrFinalizerName = "loadbalancerrequest.butler.butlerlabs.dev/aws-finalizer"
 	lbrRequeueShort  = 10 * time.Second
 	lbrRequeueLong   = 30 * time.Second
+
+	// maxNLBNameLength is the AWS limit for NLB and target group names.
+	maxNLBNameLength = 32
+	// nlbSuffixLength is the length of the longest suffix we append ("-cp-nlb" = 7 chars).
+	nlbSuffixLength = 7
+	// maxClusterNameForNLB is the maximum cluster name length that fits within the NLB name limit.
+	maxClusterNameForNLB = maxNLBNameLength - nlbSuffixLength // 25
 )
 
 // LoadBalancerRequestReconciler reconciles LoadBalancerRequest objects for AWS.
@@ -111,7 +119,7 @@ func (r *LoadBalancerRequestReconciler) Reconcile(ctx context.Context, req ctrl.
 	case butlerv1alpha1.LoadBalancerPhaseCreating:
 		return r.reconcileCreate(ctx, lbr, pc, elbClient)
 	case butlerv1alpha1.LoadBalancerPhaseReady:
-		return r.reconcileTargets(ctx, lbr, elbClient)
+		return r.reconcileTargets(ctx, lbr, pc, elbClient)
 	case butlerv1alpha1.LoadBalancerPhaseFailed:
 		return ctrl.Result{}, nil
 	default:
@@ -124,10 +132,30 @@ func (r *LoadBalancerRequestReconciler) Reconcile(ctx context.Context, req ctrl.
 func (r *LoadBalancerRequestReconciler) reconcileCreate(ctx context.Context, lbr *butlerv1alpha1.LoadBalancerRequest, pc *butlerv1alpha1.ProviderConfig, elbClient *elbv2.Client) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	awsConfig := pc.Spec.AWS
+
+	if awsConfig == nil {
+		return r.updateStatusError(ctx, lbr, butlerv1alpha1.ReasonInvalidConfiguration,
+			"ProviderConfig has no AWS configuration")
+	}
+
 	name := lbr.Spec.ClusterName
 	port := lbr.Spec.Port
 	if port == 0 {
 		port = 6443
+	}
+
+	// Validate NLB name length. AWS NLB names are limited to 32 characters.
+	// We append "-cp-nlb" (7 chars), so the cluster name must be at most 25 chars.
+	if len(name)+nlbSuffixLength > maxNLBNameLength {
+		return r.updateStatusError(ctx, lbr, butlerv1alpha1.ReasonInvalidConfiguration,
+			fmt.Sprintf("clusterName %q is too long for AWS NLB naming: max %d characters (name + '-cp-nlb' suffix must fit within %d character AWS limit)",
+				name, maxClusterNameForNLB, maxNLBNameLength))
+	}
+
+	// Validate subnets are configured.
+	if len(awsConfig.SubnetIDs) == 0 {
+		return r.updateStatusError(ctx, lbr, butlerv1alpha1.ReasonInvalidConfiguration,
+			"ProviderConfig AWS configuration has no SubnetIDs configured")
 	}
 
 	if lbr.Status.Phase != butlerv1alpha1.LoadBalancerPhaseCreating {
@@ -149,14 +177,11 @@ func (r *LoadBalancerRequestReconciler) reconcileCreate(ctx context.Context, lbr
 	nlbName := name + "-cp-nlb"
 	log.Info("Ensuring NLB", "name", nlbName)
 
-	var subnetIDs []string
-	if len(awsConfig.SubnetIDs) > 0 {
-		subnetIDs = []string{awsConfig.SubnetIDs[0]}
-	}
+	subnetIDs := awsConfig.SubnetIDs
 
 	nlbARN, nlbDNS, err := r.ensureNLB(ctx, elbClient, nlbName, subnetIDs)
 	if err != nil {
-		return r.updateStatusError(ctx, lbr, butlerv1alpha1.ReasonProviderError, fmt.Sprintf("creating NLB: %v", err))
+		return r.updateStatusRetryableError(ctx, lbr, butlerv1alpha1.ReasonProviderError, fmt.Sprintf("creating NLB: %v", err))
 	}
 	log.Info("NLB ready", "arn", nlbARN, "dns", nlbDNS)
 
@@ -164,9 +189,10 @@ func (r *LoadBalancerRequestReconciler) reconcileCreate(ctx context.Context, lbr
 	tgName := name + "-cp-tg"
 	log.Info("Ensuring target group", "name", tgName)
 
-	tgARN, err := r.ensureTargetGroup(ctx, elbClient, tgName, awsConfig.VPCID, port)
+	healthCheckPort := lbr.GetHealthCheckPort()
+	tgARN, err := r.ensureTargetGroup(ctx, elbClient, tgName, awsConfig.VPCID, port, healthCheckPort)
 	if err != nil {
-		return r.updateStatusError(ctx, lbr, butlerv1alpha1.ReasonProviderError, fmt.Sprintf("creating target group: %v", err))
+		return r.updateStatusRetryableError(ctx, lbr, butlerv1alpha1.ReasonProviderError, fmt.Sprintf("creating target group: %v", err))
 	}
 	log.Info("Target group ready", "arn", tgARN)
 
@@ -175,7 +201,7 @@ func (r *LoadBalancerRequestReconciler) reconcileCreate(ctx context.Context, lbr
 
 	err = r.ensureListener(ctx, elbClient, nlbARN, tgARN, port)
 	if err != nil {
-		return r.updateStatusError(ctx, lbr, butlerv1alpha1.ReasonProviderError, fmt.Sprintf("creating listener: %v", err))
+		return r.updateStatusRetryableError(ctx, lbr, butlerv1alpha1.ReasonProviderError, fmt.Sprintf("creating listener: %v", err))
 	}
 
 	// Update status to Ready
@@ -209,8 +235,14 @@ func (r *LoadBalancerRequestReconciler) reconcileCreate(ctx context.Context, lbr
 
 // reconcileTargets synchronizes LoadBalancerRequest.Spec.Targets with the AWS
 // NLB target group's registered instances.
-func (r *LoadBalancerRequestReconciler) reconcileTargets(ctx context.Context, lbr *butlerv1alpha1.LoadBalancerRequest, elbClient *elbv2.Client) (ctrl.Result, error) {
+func (r *LoadBalancerRequestReconciler) reconcileTargets(ctx context.Context, lbr *butlerv1alpha1.LoadBalancerRequest, pc *butlerv1alpha1.ProviderConfig, elbClient *elbv2.Client) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
+
+	if pc.Spec.AWS == nil {
+		return r.updateStatusError(ctx, lbr, butlerv1alpha1.ReasonInvalidConfiguration,
+			"ProviderConfig has no AWS configuration")
+	}
+
 	tgName := lbr.Spec.ClusterName + "-cp-tg"
 
 	// Look up target group ARN by name
@@ -228,28 +260,76 @@ func (r *LoadBalancerRequestReconciler) reconcileTargets(ctx context.Context, lb
 
 	tgARN := descResp.TargetGroups[0].TargetGroupArn
 
+	// Build set of desired target instance IDs
+	desiredTargets := make(map[string]struct{})
 	for _, target := range lbr.Spec.Targets {
 		instanceID := target.InstanceID
 		if instanceID == "" {
 			continue
 		}
+		desiredTargets[instanceID] = struct{}{}
 
-		_, err := elbClient.RegisterTargets(ctx, &elbv2.RegisterTargetsInput{
+		// RegisterTargets is idempotent -- re-registering an already-registered
+		// target is a no-op, so we do not need to check for duplicates.
+		_, regErr := elbClient.RegisterTargets(ctx, &elbv2.RegisterTargetsInput{
 			TargetGroupArn: tgARN,
 			Targets: []elbv2types.TargetDescription{
 				{Id: aws.String(instanceID)},
 			},
 		})
-		if err != nil {
-			if !isAWSAlreadyRegistered(err) {
-				log.Info("Could not register target", "instanceID", instanceID, "error", err)
-			}
+		if regErr != nil {
+			log.Info("Could not register target", "instanceID", instanceID, "error", regErr)
 			continue
 		}
 		log.Info("Registered target with NLB target group", "instanceID", instanceID)
 	}
 
-	lbr.Status.RegisteredTargets = int32(len(lbr.Spec.Targets))
+	// De-register stale targets that are no longer in the spec
+	healthResp, err := elbClient.DescribeTargetHealth(ctx, &elbv2.DescribeTargetHealthInput{
+		TargetGroupArn: tgARN,
+	})
+	if err != nil {
+		log.Error(err, "Failed to describe target health for de-registration")
+		return ctrl.Result{RequeueAfter: lbrRequeueShort}, nil
+	}
+
+	var staleTargets []elbv2types.TargetDescription
+	for _, thd := range healthResp.TargetHealthDescriptions {
+		if thd.Target == nil || thd.Target.Id == nil {
+			continue
+		}
+		targetID := aws.ToString(thd.Target.Id)
+		if _, ok := desiredTargets[targetID]; !ok {
+			staleTargets = append(staleTargets, elbv2types.TargetDescription{
+				Id: aws.String(targetID),
+			})
+		}
+	}
+
+	if len(staleTargets) > 0 {
+		log.Info("De-registering stale targets", "count", len(staleTargets))
+		_, err := elbClient.DeregisterTargets(ctx, &elbv2.DeregisterTargetsInput{
+			TargetGroupArn: tgARN,
+			Targets:        staleTargets,
+		})
+		if err != nil {
+			log.Error(err, "Failed to de-register stale targets")
+			// Continue -- we will retry on next reconcile
+		}
+	}
+
+	// Set RegisteredTargets based on actual target group membership.
+	// Re-describe after registration/deregistration to get the accurate count.
+	currentHealthResp, err := elbClient.DescribeTargetHealth(ctx, &elbv2.DescribeTargetHealthInput{
+		TargetGroupArn: tgARN,
+	})
+	if err != nil {
+		log.Error(err, "Failed to describe target health for status update")
+		lbr.Status.RegisteredTargets = int32(len(desiredTargets))
+	} else {
+		lbr.Status.RegisteredTargets = int32(len(currentHealthResp.TargetHealthDescriptions))
+	}
+
 	now := metav1.Now()
 	lbr.Status.LastUpdated = &now
 	if err := r.Status().Update(ctx, lbr); err != nil {
@@ -263,6 +343,15 @@ func (r *LoadBalancerRequestReconciler) reconcileTargets(ctx context.Context, lb
 // listener, target group, then NLB.
 func (r *LoadBalancerRequestReconciler) reconcileDelete(ctx context.Context, lbr *butlerv1alpha1.LoadBalancerRequest, pc *butlerv1alpha1.ProviderConfig, elbClient *elbv2.Client) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
+
+	if pc.Spec.AWS == nil {
+		log.Info("ProviderConfig has no AWS configuration, removing finalizer")
+		controllerutil.RemoveFinalizer(lbr, lbrFinalizerName)
+		if err := r.Update(ctx, lbr); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
 
 	if lbr.Status.Phase != butlerv1alpha1.LoadBalancerPhaseDeleting {
 		lbr.SetPhase(butlerv1alpha1.LoadBalancerPhaseDeleting)
@@ -390,7 +479,7 @@ func (r *LoadBalancerRequestReconciler) ensureNLB(ctx context.Context, elbClient
 }
 
 // ensureTargetGroup creates a TCP target group if it doesn't exist and returns its ARN.
-func (r *LoadBalancerRequestReconciler) ensureTargetGroup(ctx context.Context, elbClient *elbv2.Client, name, vpcID string, port int32) (string, error) {
+func (r *LoadBalancerRequestReconciler) ensureTargetGroup(ctx context.Context, elbClient *elbv2.Client, name, vpcID string, port, healthCheckPort int32) (string, error) {
 	// Check if already exists
 	descResp, err := elbClient.DescribeTargetGroups(ctx, &elbv2.DescribeTargetGroupsInput{
 		Names: []string{name},
@@ -410,7 +499,7 @@ func (r *LoadBalancerRequestReconciler) ensureTargetGroup(ctx context.Context, e
 		VpcId:                      aws.String(vpcID),
 		TargetType:                 elbv2types.TargetTypeEnumInstance,
 		HealthCheckProtocol:        elbv2types.ProtocolEnumTcp,
-		HealthCheckPort:            aws.String(fmt.Sprintf("%d", port)),
+		HealthCheckPort:            aws.String(fmt.Sprintf("%d", healthCheckPort)),
 		HealthCheckIntervalSeconds: aws.Int32(10),
 		HealthyThresholdCount:      aws.Int32(2),
 		UnhealthyThresholdCount:    aws.Int32(3),
@@ -428,20 +517,35 @@ func (r *LoadBalancerRequestReconciler) ensureTargetGroup(ctx context.Context, e
 	return aws.ToString(createResp.TargetGroups[0].TargetGroupArn), nil
 }
 
-// ensureListener creates a TCP listener on the NLB forwarding to the target group if one doesn't exist.
+// ensureListener creates a TCP listener on the NLB forwarding to the target group
+// if one doesn't already exist with the expected port and target group.
 func (r *LoadBalancerRequestReconciler) ensureListener(ctx context.Context, elbClient *elbv2.Client, nlbARN, tgARN string, port int32) error {
 	// Check if a listener already exists for this NLB
 	descResp, err := elbClient.DescribeListeners(ctx, &elbv2.DescribeListenersInput{
 		LoadBalancerArn: aws.String(nlbARN),
 	})
-	if err == nil && len(descResp.Listeners) > 0 {
-		return nil // Already exists
-	}
 	if err != nil && !isAWSNotFound(err) {
 		return fmt.Errorf("checking listeners: %w", err)
 	}
 
-	// Create
+	// Check if an existing listener matches the expected port and target group
+	if err == nil {
+		for _, listener := range descResp.Listeners {
+			listenerPort := aws.ToInt32(listener.Port)
+			if listenerPort != port {
+				continue
+			}
+			// Verify the default action forwards to the expected target group
+			for _, action := range listener.DefaultActions {
+				if action.Type == elbv2types.ActionTypeEnumForward &&
+					aws.ToString(action.TargetGroupArn) == tgARN {
+					return nil // Listener matches expected configuration
+				}
+			}
+		}
+	}
+
+	// Create listener (no matching listener found)
 	_, err = elbClient.CreateListener(ctx, &elbv2.CreateListenerInput{
 		LoadBalancerArn: aws.String(nlbARN),
 		Protocol:        elbv2types.ProtocolEnumTcp,
@@ -454,6 +558,12 @@ func (r *LoadBalancerRequestReconciler) ensureListener(ctx context.Context, elbC
 		},
 	})
 	if err != nil {
+		// A DuplicateListener error means a listener exists on this port but
+		// with a different target group. This is a configuration conflict.
+		var dupErr *elbv2types.DuplicateListenerException
+		if errors.As(err, &dupErr) {
+			return fmt.Errorf("listener already exists on port %d with a different target group: %w", port, err)
+		}
 		return fmt.Errorf("creating listener: %w", err)
 	}
 
@@ -520,6 +630,8 @@ func (r *LoadBalancerRequestReconciler) updatePhase(ctx context.Context, lbr *bu
 	return ctrl.Result{Requeue: true}, nil
 }
 
+// updateStatusError sets the LBR to a terminal Failed state. Use for
+// configuration errors and bad credentials that will not resolve on retry.
 func (r *LoadBalancerRequestReconciler) updateStatusError(ctx context.Context, lbr *butlerv1alpha1.LoadBalancerRequest, reason, message string) (ctrl.Result, error) {
 	lbr.SetFailure(reason, message)
 	meta.SetStatusCondition(&lbr.Status.Conditions, metav1.Condition{
@@ -536,23 +648,53 @@ func (r *LoadBalancerRequestReconciler) updateStatusError(ctx context.Context, l
 	return ctrl.Result{}, nil
 }
 
+// updateStatusRetryableError sets a Degraded condition and requeues for retry.
+// Use for transient AWS API errors that may resolve on subsequent attempts.
+// Unlike updateStatusError, this does NOT set the phase to Failed.
+func (r *LoadBalancerRequestReconciler) updateStatusRetryableError(ctx context.Context, lbr *butlerv1alpha1.LoadBalancerRequest, reason, message string) (ctrl.Result, error) {
+	meta.SetStatusCondition(&lbr.Status.Conditions, metav1.Condition{
+		Type:               butlerv1alpha1.ConditionTypeDegraded,
+		Status:             metav1.ConditionTrue,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: lbr.Generation,
+	})
+	now := metav1.Now()
+	lbr.Status.LastUpdated = &now
+	if err := r.Status().Update(ctx, lbr); err != nil {
+		return ctrl.Result{}, err
+	}
+	r.Recorder.Event(lbr, corev1.EventTypeWarning, reason, message)
+	return ctrl.Result{RequeueAfter: lbrRequeueShort}, nil
+}
+
+// isAWSNotFound checks whether the error is an AWS "not found" exception using
+// typed error checking with the AWS SDK v2 smithy error interface.
 func isAWSNotFound(err error) bool {
 	if err == nil {
 		return false
 	}
-	s := err.Error()
-	return strings.Contains(s, "LoadBalancerNotFound") ||
-		strings.Contains(s, "TargetGroupNotFound") ||
-		strings.Contains(s, "ListenerNotFound") ||
-		strings.Contains(s, "404")
-}
-
-func isAWSAlreadyRegistered(err error) bool {
-	if err == nil {
-		return false
+	var lbNotFound *elbv2types.LoadBalancerNotFoundException
+	if errors.As(err, &lbNotFound) {
+		return true
 	}
-	s := err.Error()
-	return strings.Contains(s, "already registered") || strings.Contains(s, "DuplicateTargetGroupName")
+	var tgNotFound *elbv2types.TargetGroupNotFoundException
+	if errors.As(err, &tgNotFound) {
+		return true
+	}
+	var listenerNotFound *elbv2types.ListenerNotFoundException
+	if errors.As(err, &listenerNotFound) {
+		return true
+	}
+	// Fallback: check the smithy API error code for any other not-found codes
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		code := apiErr.ErrorCode()
+		return code == "LoadBalancerNotFound" ||
+			code == "TargetGroupNotFound" ||
+			code == "ListenerNotFound"
+	}
+	return false
 }
 
 // SetupWithManager registers the controller with the manager.
