@@ -26,6 +26,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	elbv2 "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
+	elbv2types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 )
 
 // ClientConfig holds AWS-specific configuration for the EC2 client.
@@ -39,6 +41,7 @@ type ClientConfig struct {
 // Client wraps the AWS EC2 SDK for VM lifecycle operations.
 type Client struct {
 	ec2Client *ec2.Client
+	awsCfg    aws.Config
 	region    string
 	vpcID     string
 	config    ClientConfig
@@ -58,6 +61,7 @@ func NewClient(ctx context.Context, accessKeyID, secretAccessKey, region, vpcID 
 
 	return &Client{
 		ec2Client: ec2.NewFromConfig(awsCfg),
+		awsCfg:    awsCfg,
 		region:    region,
 		vpcID:     vpcID,
 		config:    cfg,
@@ -186,6 +190,36 @@ func (c *Client) DeleteVM(ctx context.Context, name string) error {
 	})
 	if err != nil {
 		return fmt.Errorf("failed to terminate instance %s: %w", status.InstanceID, err)
+	}
+
+	return nil
+}
+
+// RegisterTarget adds an EC2 instance to an NLB target group for load balancing.
+// The target group is looked up by name (convention: {cluster-name}-cp-tg).
+func (c *Client) RegisterTarget(ctx context.Context, targetGroupName string, instanceID string) error {
+	elbClient := elbv2.NewFromConfig(c.awsCfg)
+
+	descResp, err := elbClient.DescribeTargetGroups(ctx, &elbv2.DescribeTargetGroupsInput{
+		Names: []string{targetGroupName},
+	})
+	if err != nil {
+		return fmt.Errorf("looking up target group %s: %w", targetGroupName, err)
+	}
+	if len(descResp.TargetGroups) == 0 {
+		return fmt.Errorf("target group %s not found", targetGroupName)
+	}
+
+	tgARN := descResp.TargetGroups[0].TargetGroupArn
+
+	_, err = elbClient.RegisterTargets(ctx, &elbv2.RegisterTargetsInput{
+		TargetGroupArn: tgARN,
+		Targets: []elbv2types.TargetDescription{
+			{Id: aws.String(instanceID)},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("registering instance %s with target group %s: %w", instanceID, targetGroupName, err)
 	}
 
 	return nil

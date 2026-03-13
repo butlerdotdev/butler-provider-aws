@@ -237,6 +237,21 @@ func (r *MachineRequestReconciler) reconcileCreating(
 		}
 
 		r.Recorder.Eventf(mr, corev1.EventTypeNormal, "Ready", "EC2 instance is running with IP %s", ip)
+
+		// Register CP instances with NLB target group for HA
+		if role, ok := mr.Labels["butler.butlerlabs.dev/role"]; ok && role == "control-plane" {
+			if clusterName, ok := mr.Labels["butler.butlerlabs.dev/cluster"]; ok && clusterName != "" {
+				targetGroup := clusterName + "-cp-tg"
+				log.Info("Adding CP instance to NLB target group", "targetGroup", targetGroup, "instance", status.InstanceID)
+				if err := ac.RegisterTarget(ctx, targetGroup, status.InstanceID); err != nil {
+					log.Info("Could not add instance to target group (may not exist for single-node)", "error", err)
+				} else {
+					log.Info("Instance added to NLB target group", "targetGroup", targetGroup)
+					r.Recorder.Eventf(mr, corev1.EventTypeNormal, "LBRegistered", "Added to NLB target group %s", targetGroup)
+				}
+			}
+		}
+
 		return ctrl.Result{}, nil
 	}
 
