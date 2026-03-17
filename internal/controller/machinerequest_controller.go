@@ -147,6 +147,7 @@ func (r *MachineRequestReconciler) reconcilePending(
 		DiskGB:   mr.Spec.DiskGB,
 		UserData: mr.Spec.UserData,
 		Labels:   mr.Spec.Labels,
+		Image:    mr.Spec.Image,
 	}
 
 	instanceID, err := ac.CreateVM(ctx, opts)
