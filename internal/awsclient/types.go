@@ -61,11 +61,12 @@ type VMCreateOptions struct {
 
 // VMStatus represents the current status of an EC2 instance.
 type VMStatus struct {
-	Exists     bool
-	Status     string // running, pending, stopping, stopped, terminated
-	IPAddress  string // Private IP
-	ExternalIP string // Public IP (if present)
-	InstanceID string // EC2 instance ID
+	Exists           bool
+	Status           string // running, pending, stopping, stopped, terminated
+	IPAddress        string // Private IP
+	ExternalIP       string // Public IP (if present)
+	InstanceID       string // EC2 instance ID
+	AvailabilityZone string // e.g., us-east-1a
 }
 
 // NotFoundError indicates an EC2 resource was not found.

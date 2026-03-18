@@ -176,12 +176,17 @@ func (c *Client) GetVMStatus(ctx context.Context, name string) (*VMStatus, error
 
 	for _, reservation := range result.Reservations {
 		for _, instance := range reservation.Instances {
+			az := ""
+			if instance.Placement != nil {
+				az = aws.ToString(instance.Placement.AvailabilityZone)
+			}
 			return &VMStatus{
-				Exists:     true,
-				Status:     string(instance.State.Name),
-				IPAddress:  aws.ToString(instance.PrivateIpAddress),
-				ExternalIP: aws.ToString(instance.PublicIpAddress),
-				InstanceID: aws.ToString(instance.InstanceId),
+				Exists:           true,
+				Status:           string(instance.State.Name),
+				IPAddress:        aws.ToString(instance.PrivateIpAddress),
+				ExternalIP:       aws.ToString(instance.PublicIpAddress),
+				InstanceID:       aws.ToString(instance.InstanceId),
+				AvailabilityZone: az,
 			}, nil
 		}
 	}
