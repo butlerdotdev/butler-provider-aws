@@ -370,8 +370,6 @@ func (r *MachineRequestReconciler) reconcileDelete(
 	return ctrl.Result{}, nil
 }
 
-// Helper methods
-
 func (r *MachineRequestReconciler) getProviderConfig(ctx context.Context, mr *butlerv1alpha1.MachineRequest) (*butlerv1alpha1.ProviderConfig, error) {
 	pc := &butlerv1alpha1.ProviderConfig{}
 	ns := mr.Spec.ProviderRef.Namespace

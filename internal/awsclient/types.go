@@ -33,10 +33,8 @@ const (
 	DefaultAMI          = "" // Must be specified per region
 )
 
-// DefaultTalosAMIs maps AWS regions to custom Talos Linux v1.12.2 AMIs (amd64)
-// with iscsi-tools and util-linux-tools extensions (required for Longhorn storage).
+// DefaultTalosAMIs maps regions to custom Talos v1.12.2 AMIs with iscsi-tools + util-linux-tools.
 // Schematic: 613e1592b2da41ae5e265e8789429f22e121aab91cb4deb6bc3c0b6262961245
-// Built via Talos Image Factory → S3 → import-snapshot → register-image.
 var DefaultTalosAMIs = map[string]string{
 	"us-east-1":      "ami-0cd30b7027afffd4e",
 	"us-east-2":      "ami-0f0e7059a7735d0a0",
