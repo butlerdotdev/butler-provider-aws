@@ -147,6 +147,7 @@ func (r *MachineRequestReconciler) reconcilePending(
 		DiskGB:   mr.Spec.DiskGB,
 		UserData: mr.Spec.UserData,
 		Labels:   mr.Spec.Labels,
+		Image:    mr.Spec.Image,
 	}
 
 	instanceID, err := ac.CreateVM(ctx, opts)
@@ -210,10 +211,27 @@ func (r *MachineRequestReconciler) reconcileCreating(
 		if status.ExternalIP != "" {
 			ip = status.ExternalIP
 		}
-		log.Info("EC2 instance is ready", "ip", ip, "internalIP", status.IPAddress, "externalIP", status.ExternalIP)
+		log.Info("EC2 instance is ready", "ip", ip, "internalIP", status.IPAddress, "externalIP", status.ExternalIP, "az", status.AvailabilityZone)
+
+		// Annotate the MachineRequest with the AZ for providerID construction.
+		if status.AvailabilityZone != "" {
+			if mr.Annotations == nil {
+				mr.Annotations = make(map[string]string)
+			}
+			mr.Annotations["butler.butlerlabs.dev/availability-zone"] = status.AvailabilityZone
+			if err := r.Update(ctx, mr); err != nil {
+				log.Error(err, "Failed to update MachineRequest annotations")
+			}
+		}
 
 		mr.Status.Phase = butlerv1alpha1.MachinePhaseRunning
 		mr.Status.IPAddress = ip
+		// Store both IPs in IPAddresses so the bootstrap controller can map
+		// nodes (which use private IPs as hostnames) to instance IDs.
+		mr.Status.IPAddresses = []string{status.IPAddress}
+		if status.ExternalIP != "" && status.ExternalIP != status.IPAddress {
+			mr.Status.IPAddresses = append(mr.Status.IPAddresses, status.ExternalIP)
+		}
 		now := metav1.Now()
 		mr.Status.LastUpdated = &now
 
@@ -302,6 +320,10 @@ func (r *MachineRequestReconciler) reconcileRunning(
 	if ip != "" && ip != mr.Status.IPAddress {
 		log.Info("EC2 instance IP changed", "old", mr.Status.IPAddress, "new", ip)
 		mr.Status.IPAddress = ip
+		mr.Status.IPAddresses = []string{status.IPAddress}
+		if status.ExternalIP != "" && status.ExternalIP != status.IPAddress {
+			mr.Status.IPAddresses = append(mr.Status.IPAddresses, status.ExternalIP)
+		}
 		now := metav1.Now()
 		mr.Status.LastUpdated = &now
 		if err := r.Status().Update(ctx, mr); err != nil {
@@ -347,8 +369,6 @@ func (r *MachineRequestReconciler) reconcileDelete(
 	r.Recorder.Event(mr, corev1.EventTypeNormal, "Deleted", "EC2 instance terminated")
 	return ctrl.Result{}, nil
 }
-
-// Helper methods
 
 func (r *MachineRequestReconciler) getProviderConfig(ctx context.Context, mr *butlerv1alpha1.MachineRequest) (*butlerv1alpha1.ProviderConfig, error) {
 	pc := &butlerv1alpha1.ProviderConfig{}

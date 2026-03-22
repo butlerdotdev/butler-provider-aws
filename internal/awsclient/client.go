@@ -75,8 +75,22 @@ func (c *Client) CreateVM(ctx context.Context, opts VMCreateOptions) (string, er
 		instanceType = types.InstanceType(DefaultInstanceType)
 	}
 
+	// Resolve AMI: per-request override > client config > default Talos AMI for region
+	ami := c.config.AMI
+	if opts.Image != "" {
+		ami = opts.Image
+	}
+	if ami == "" {
+		if defaultAMI, ok := DefaultTalosAMIs[c.region]; ok {
+			ami = defaultAMI
+		}
+	}
+	if ami == "" {
+		return "", fmt.Errorf("no AMI specified: set image on MachineRequest or configure AMI in ProviderConfig (no default for region %s)", c.region)
+	}
+
 	input := &ec2.RunInstancesInput{
-		ImageId:      aws.String(c.config.AMI),
+		ImageId:      aws.String(ami),
 		InstanceType: instanceType,
 		MinCount:     aws.Int32(1),
 		MaxCount:     aws.Int32(1),
@@ -162,12 +176,17 @@ func (c *Client) GetVMStatus(ctx context.Context, name string) (*VMStatus, error
 
 	for _, reservation := range result.Reservations {
 		for _, instance := range reservation.Instances {
+			az := ""
+			if instance.Placement != nil {
+				az = aws.ToString(instance.Placement.AvailabilityZone)
+			}
 			return &VMStatus{
-				Exists:     true,
-				Status:     string(instance.State.Name),
-				IPAddress:  aws.ToString(instance.PrivateIpAddress),
-				ExternalIP: aws.ToString(instance.PublicIpAddress),
-				InstanceID: aws.ToString(instance.InstanceId),
+				Exists:           true,
+				Status:           string(instance.State.Name),
+				IPAddress:        aws.ToString(instance.PrivateIpAddress),
+				ExternalIP:       aws.ToString(instance.PublicIpAddress),
+				InstanceID:       aws.ToString(instance.InstanceId),
+				AvailabilityZone: az,
 			}, nil
 		}
 	}
