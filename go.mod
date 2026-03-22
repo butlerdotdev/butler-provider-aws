@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.211.1
 	github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2 v1.54.8
 	github.com/aws/smithy-go v1.24.2
-	github.com/butlerdotdev/butler-api v0.9.0
+	github.com/butlerdotdev/butler-api v0.9.1
 	github.com/onsi/ginkgo/v2 v2.22.0
 	github.com/onsi/gomega v1.36.1
 	k8s.io/api v0.34.1
