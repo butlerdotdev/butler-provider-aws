@@ -174,21 +174,20 @@ func (c *Client) GetVMStatus(ctx context.Context, name string) (*VMStatus, error
 		return nil, fmt.Errorf("failed to describe instances: %w", err)
 	}
 
-	for _, reservation := range result.Reservations {
-		for _, instance := range reservation.Instances {
-			az := ""
-			if instance.Placement != nil {
-				az = aws.ToString(instance.Placement.AvailabilityZone)
-			}
-			return &VMStatus{
-				Exists:           true,
-				Status:           string(instance.State.Name),
-				IPAddress:        aws.ToString(instance.PrivateIpAddress),
-				ExternalIP:       aws.ToString(instance.PublicIpAddress),
-				InstanceID:       aws.ToString(instance.InstanceId),
-				AvailabilityZone: az,
-			}, nil
+	if len(result.Reservations) > 0 && len(result.Reservations[0].Instances) > 0 {
+		instance := result.Reservations[0].Instances[0]
+		az := ""
+		if instance.Placement != nil {
+			az = aws.ToString(instance.Placement.AvailabilityZone)
 		}
+		return &VMStatus{
+			Exists:           true,
+			Status:           string(instance.State.Name),
+			IPAddress:        aws.ToString(instance.PrivateIpAddress),
+			ExternalIP:       aws.ToString(instance.PublicIpAddress),
+			InstanceID:       aws.ToString(instance.InstanceId),
+			AvailabilityZone: az,
+		}, nil
 	}
 
 	return nil, &NotFoundError{Resource: "instance", Name: name}
